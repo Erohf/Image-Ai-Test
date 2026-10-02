@@ -110,6 +110,8 @@ O script irá:
 
 | Comando | Descrição |
 | :--- | :--- |
+| `python main.py --testar-ia` | **Teste Piloto:** Chama a API **somente para as 5 imagens originais de IA** em `input_images` (sem variações de compressão). Ideal para validar detecção inicial e monitorar custos. |
+| `python main.py --apenas-ia` | Executa o pipeline completo (com as 24 variações de compressão) **apenas para as imagens de IA**, ignorando as fotos reais. |
 | `python main.py --dry-run` | Executa o pipeline simulando as chamadas da API (sem gastar créditos). Ideal para validar o fluxo. |
 | `python main.py --apenas-processar` | Gera apenas as variações e compressões de imagem sem consultar a API da OpenAI. |
 | `python main.py --criar-amostras` | Cria automaticamente 10 imagens sintéticas de exemplo (5 IA e 5 Reais) para testar o ambiente. |

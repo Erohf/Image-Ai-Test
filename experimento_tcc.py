@@ -385,7 +385,9 @@ def executar_pipeline(
     processed_dir: Path,
     results_dir: Path,
     apenas_processar: bool = False,
-    dry_run: bool = False
+    dry_run: bool = False,
+    testar_ia: bool = False,
+    apenas_ia: bool = False,
 ) -> pd.DataFrame:
     """
     Executa o fluxo completo do experimento de TCC:
@@ -395,7 +397,12 @@ def executar_pipeline(
       4. Consolida métricas em DataFrame e exporta CSV + SQLite
     """
     logger.info("=" * 70)
-    logger.info("INICIANDO PIPELINE DO EXPERIMENTO DE TCC")
+    if testar_ia:
+        logger.info("INICIANDO TESTE PILOTO: APENAS IMAGENS ORIGINAIS DE IA (INPUT_IMAGES)")
+    elif apenas_ia:
+        logger.info("INICIANDO PIPELINE: APENAS CATEGORIA IA (COM COMPRESSÕES)")
+    else:
+        logger.info("INICIANDO PIPELINE DO EXPERIMENTO DE TCC (IA + REAIS)")
     logger.info("=" * 70)
 
     # Coleta arquivos de imagem de entrada
@@ -415,30 +422,52 @@ def executar_pipeline(
         )
         return pd.DataFrame()
 
-    logger.info(f"Total de {len(arquivos_entrada)} imagens originais encontradas para o experimento.")
+    # Filtra por IA se solicitado
+    if testar_ia or apenas_ia:
+        arquivos_entrada = [
+            arq for arq in arquivos_entrada
+            if identificar_categoria_e_id(arq)[1] == "IA"
+        ]
+        logger.info(f"Filtro ativado: {len(arquivos_entrada)} imagens de IA selecionadas.")
 
-    # 1. GERAÇÃO DE TODAS AS VARIAÇÕES
-    logger.info("\n[ETAPA 1/3] Gerando variações de compressão (JPEG, WebP, PNG)...")
+    logger.info(f"Total de {len(arquivos_entrada)} imagens originais para análise.")
+
+    # 1. GERAÇÃO DE VARIAÇÕES OU TESTE DIRETO DAS ORIGINAIS
     todas_variacoes: List[Dict[str, Any]] = []
 
-    for caminho_img in tqdm(arquivos_entrada, desc="Processando compressões", unit="imagem"):
-        id_imagem, categoria = identificar_categoria_e_id(caminho_img)
-        variacoes = gerar_variacoes_imagem(
-            caminho_origem=caminho_img,
-            id_imagem=id_imagem,
-            categoria=categoria,
-            output_dir=processed_dir
-        )
-        todas_variacoes.extend(variacoes)
+    if testar_ia:
+        logger.info("\n[ETAPA 1/3] Modo '--testar-ia': Pulando compressões e usando imagens originais diretamente...")
+        for caminho_img in arquivos_entrada:
+            id_imagem, categoria = identificar_categoria_e_id(caminho_img)
+            ext_original = caminho_img.suffix.lower().lstrip(".")
+            todas_variacoes.append({
+                "id_imagem": id_imagem,
+                "categoria": categoria,
+                "formato": ext_original.upper(),
+                "tipo_compressao": "Original",
+                "nivel_qualidade": "Original",
+                "caminho_arquivo": caminho_img,
+            })
+    else:
+        logger.info("\n[ETAPA 1/3] Gerando variações de compressão (JPEG, WebP, PNG)...")
+        for caminho_img in tqdm(arquivos_entrada, desc="Processando compressões", unit="imagem"):
+            id_imagem, categoria = identificar_categoria_e_id(caminho_img)
+            variacoes = gerar_variacoes_imagem(
+                caminho_origem=caminho_img,
+                id_imagem=id_imagem,
+                categoria=categoria,
+                output_dir=processed_dir
+            )
+            todas_variacoes.extend(variacoes)
 
-    logger.info(f"Total de {len(todas_variacoes)} variações geradas na pasta '{processed_dir}'.")
+        logger.info(f"Total de {len(todas_variacoes)} variações geradas na pasta '{processed_dir}'.")
 
     if apenas_processar:
         logger.info("Opção '--apenas-processar' ativada. Encerrando sem chamar a API.")
         return pd.DataFrame(todas_variacoes)
 
     # 2. CHAMADAS PARA A API DA OPENAI
-    logger.info("\n[ETAPA 2/3] Integrando com a API de Proveniência da OpenAI...")
+    logger.info(f"\n[ETAPA 2/3] Integrando com a API de Proveniência da OpenAI ({len(todas_variacoes)} chamadas programadas)...")
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     client = None
@@ -561,9 +590,14 @@ def main():
         help="Executa em modo simulado (sem gastar chamadas ou créditos da API da OpenAI).",
     )
     parser.add_argument(
-        "--criar-amostras",
+        "--testar-ia",
         action="store_true",
-        help="Gera 10 imagens de demonstração (5 IA e 5 Reais) na pasta de entrada para testes imediatos.",
+        help="Executa o teste piloto chamando a API somente para as imagens originais de IA em input_images (sem compressões), para avaliar detecção e custos.",
+    )
+    parser.add_argument(
+        "--apenas-ia",
+        action="store_true",
+        help="Executa o pipeline completo (com variações de compressão) apenas para as imagens de IA, ignorando as reais.",
     )
 
     args = parser.parse_args()
@@ -579,6 +613,8 @@ def main():
         results_dir=args.results_dir,
         apenas_processar=args.apenas_processar,
         dry_run=args.dry_run,
+        testar_ia=getattr(args, "testar_ia", False),
+        apenas_ia=getattr(args, "apenas_ia", False),
     )
 
 
