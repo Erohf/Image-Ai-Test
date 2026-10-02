@@ -1,0 +1,69 @@
+# ==============================================================================
+# Git Ignore - Experimento de TCC (Image AI Test)
+# ==============================================================================
+
+# Bytecode e caches do Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Variáveis de ambiente e Segredos (CRÍTICO: nunca subir sua chave de API para o GitHub)
+.env
+.env*.local
+*.key
+*.pem
+
+# Imagens processadas e intermediárias geradas pelo script
+# (evita subir centenas de arquivos pesados gerados automaticamente)
+processed_images/*
+!processed_images/.gitkeep
+
+# Arquivos de log e auditoria local
+*.log
+*.sqlite3
+
+# Arquivos de sistema operacional
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_office.db
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Configurações de IDEs e editores de código
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
