@@ -70,17 +70,26 @@ def converter_para_rgb_se_necessario(img: Image.Image) -> Image.Image:
 def identificar_categoria_e_id(caminho_imagem: Path) -> Tuple[str, str]:
     """
     Identifica a categoria ('IA' ou 'Real') e um identificador único para a imagem.
-    Aceita organização por pastas (ex: /ia/ e /real/) ou nome de arquivo (ex: ia_01.png, real_01.jpg).
+    Prioriza a pasta onde a imagem está (/ia/ ou /real/) ou termos no nome do arquivo.
     """
     nome_completo = caminho_imagem.stem.lower()
+    pasta_pai = caminho_imagem.parent.name.lower()
     caminho_str = str(caminho_imagem).lower()
 
-    if "real" in nome_completo or "real" in caminho_str or "foto" in nome_completo:
+    # Prioridade 1: Nome da pasta imediata
+    if pasta_pai == "real":
+        categoria = "Real"
+    elif pasta_pai in ("ia", "ai"):
+        categoria = "IA"
+    # Prioridade 2: Termos explícitos no nome do arquivo
+    elif "real" in nome_completo or "foto" in nome_completo:
         categoria = "Real"
     elif "ia" in nome_completo or "ai" in nome_completo or "synth" in nome_completo or "dalle" in nome_completo:
         categoria = "IA"
+    # Prioridade 3: Caminho completo
+    elif "real" in caminho_str:
+        categoria = "Real"
     else:
-        # Se não puder inferir, assume IA por padrão
         categoria = "IA"
 
     id_imagem = caminho_imagem.stem
@@ -343,41 +352,7 @@ def salvar_resultados(df: pd.DataFrame, results_dir: Path) -> Tuple[Path, Path]:
 
 
 # ==============================================================================
-# 5. GERADOR DE IMAGENS DE TESTE (DEMO / AMBIENTE INICIAL)
-# ==============================================================================
-
-def criar_imagens_exemplo(input_dir: Path) -> None:
-    """
-    Cria imagens sintéticas de exemplo (5 IA e 5 Reais) na pasta input_images
-    caso o usuário queira validar o pipeline antes de colocar as imagens definitivas.
-    """
-    from PIL import ImageDraw
-
-    pasta_ia = input_dir / "ia"
-    pasta_real = input_dir / "real"
-    pasta_ia.mkdir(parents=True, exist_ok=True)
-    pasta_real.mkdir(parents=True, exist_ok=True)
-
-    cores_ia = [(70, 130, 180), (147, 112, 219), (60, 179, 113), (255, 105, 180), (255, 165, 0)]
-    cores_real = [(100, 100, 100), (139, 69, 19), (47, 79, 79), (72, 61, 139), (112, 128, 144)]
-
-    for idx, cor in enumerate(cores_ia, 1):
-        img = Image.new("RGB", (512, 512), color=cor)
-        draw = ImageDraw.Draw(img)
-        draw.text((20, 240), f"Amostra IA #{idx}", fill=(255, 255, 255))
-        img.save(pasta_ia / f"ia_exemplo_{idx:02d}.png", format="PNG")
-
-    for idx, cor in enumerate(cores_real, 1):
-        img = Image.new("RGB", (512, 512), color=cor)
-        draw = ImageDraw.Draw(img)
-        draw.text((20, 240), f"Amostra Real #{idx}", fill=(255, 255, 255))
-        img.save(pasta_real / f"real_exemplo_{idx:02d}.jpg", format="JPEG", quality=95)
-
-    logger.info(f"10 imagens de exemplo geradas com sucesso em: {input_dir}")
-
-
-# ==============================================================================
-# 6. EXECUÇÃO DO PIPELINE COMPLETO
+# 5. EXECUÇÃO DO PIPELINE COMPLETO
 # ==============================================================================
 
 def executar_pipeline(
@@ -417,8 +392,8 @@ def executar_pipeline(
     if not arquivos_entrada:
         logger.warning(
             f"Nenhuma imagem encontrada em '{input_dir}'!\n"
-            f"Coloque 5 imagens geradas por IA e 5 imagens reais na pasta '{input_dir}'.\n"
-            f"Você também pode usar o argumento '--criar-amostras' para gerar dados sintéticos de teste."
+            f"Coloque 5 imagens geradas por IA na pasta '{input_dir}/ia' "
+            f"e 5 imagens reais na pasta '{input_dir}/real'."
         )
         return pd.DataFrame()
 
@@ -601,11 +576,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    if getattr(args, "criar_amostras", False):
-        criar_imagens_exemplo(args.input_dir)
-        if len(sys.argv) == 2 and "--criar-amostras" in sys.argv:
-            return
 
     executar_pipeline(
         input_dir=args.input_dir,

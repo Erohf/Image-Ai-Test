@@ -114,7 +114,6 @@ O script irá:
 | `python main.py --apenas-ia` | Executa o pipeline completo (com as 24 variações de compressão) **apenas para as imagens de IA**, ignorando as fotos reais. |
 | `python main.py --dry-run` | Executa o pipeline simulando as chamadas da API (sem gastar créditos). Ideal para validar o fluxo. |
 | `python main.py --apenas-processar` | Gera apenas as variações e compressões de imagem sem consultar a API da OpenAI. |
-| `python main.py --criar-amostras` | Cria automaticamente 10 imagens sintéticas de exemplo (5 IA e 5 Reais) para testar o ambiente. |
 | `python main.py --input-dir ./pasta` | Permite customizar a pasta das imagens de entrada. |
 | `python main.py --results-dir ./saida` | Permite customizar a pasta dos relatórios finais. |
 
