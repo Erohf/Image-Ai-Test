@@ -10,6 +10,7 @@ Requisitos: openai>=2.52.0, Pillow, pandas, tqdm, python-dotenv
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -18,6 +19,7 @@ import logging
 import sqlite3
 import argparse
 from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
 import pandas as pd
@@ -287,13 +289,33 @@ def verificar_proveniencia_openai(
             }
 
         except Exception as e:
-            # Tratamento de erro com exponential backoff
+            # Tratamento de erro com detecção inteligente de Rate Limit e backoff
             erro_str = str(e)
             is_rate_limit = "429" in erro_str or "rate_limit" in erro_str.lower()
             is_server_error = any(code in erro_str for code in ("500", "502", "503", "504"))
 
+            # Tenta extrair o tempo exato indicado pela OpenAI (ex: "try again after 3279.897 seconds")
+            match_tempo = re.search(r"try again after ([\d\.]+) seconds", erro_str)
+            segundos_espera = float(match_tempo.group(1)) if match_tempo else None
+
+            # Se a OpenAI pediu para esperar mais de 60 segundos (limite de cota por hora)
+            if is_rate_limit and segundos_espera and segundos_espera > 60:
+                logger.warning(
+                    f"Cota horária da OpenAI atingida para {nome_arquivo}. "
+                    f"Tempo exigido pela API: {segundos_espera/60:.1f} minutos ({segundos_espera:.0f}s)."
+                )
+                return {
+                    "c2pa_outcome": "rate_limit",
+                    "c2pa_validation_state": "rate_limit",
+                    "c2pa_issuer": "N/A",
+                    "synthid_outcome": "rate_limit",
+                    "resposta_bruta_json": json.dumps({"erro": erro_str, "retry_after_seconds": segundos_espera}),
+                    "status_api": "rate_limit_longo",
+                    "segundos_espera": segundos_espera,
+                }
+
             if tentativa < max_retries and (is_rate_limit or is_server_error or "connection" in erro_str.lower()):
-                # Exponential backoff + jitter
+                # Exponential backoff + jitter para erros de rajada curta
                 espera = (base_delay * (2 ** (tentativa - 1))) + random.uniform(0.1, 1.0)
                 logger.warning(
                     f"[Tentativa {tentativa}/{max_retries}] Erro transitório na API ({e}). "
@@ -337,18 +359,38 @@ def salvar_resultados(df: pd.DataFrame, results_dir: Path) -> Tuple[Path, Path]:
 
     # 1. Salva CSV em UTF-8 com formatação limpa
     df.to_csv(caminho_csv, index=False, encoding="utf-8-sig")
-    logger.info(f"Resultados exportados para CSV com sucesso: {caminho_csv}")
 
     # 2. Salva em banco SQLite
     try:
         conn = sqlite3.connect(caminho_db)
         df.to_sql("experimento_tcc", conn, if_exists="replace", index=False)
         conn.close()
-        logger.info(f"Resultados gravados no banco SQLite com sucesso: {caminho_db}")
     except Exception as e:
         logger.error(f"Erro ao salvar dados no SQLite ({caminho_db}): {e}", exc_info=True)
 
     return caminho_csv, caminho_db
+
+
+def carregar_progresso_existente(results_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """
+    Carrega resultados prévios já concluídos com sucesso para evitar retrabalho
+    e permitir que o experimento continue de onde parou após interrupções ou rate limits.
+    """
+    caminho_csv = results_dir / "experimento_tcc.csv"
+    progresso = {}
+    if caminho_csv.exists():
+        try:
+            df_existente = pd.read_csv(caminho_csv)
+            for _, row in df_existente.iterrows():
+                outcome_c2pa = str(row.get("c2pa_outcome", ""))
+                outcome_synth = str(row.get("synthid_outcome", ""))
+                # Apenas amostras que não deram erro ou rate limit são reaproveitadas
+                if outcome_c2pa not in ("erro", "rate_limit", "nan", "") and outcome_synth not in ("erro", "rate_limit", "nan", ""):
+                    chave = f"{row['id_imagem']}_{row['categoria']}_{row['formato']}_{row['tipo_compressao']}_{row['nivel_qualidade']}"
+                    progresso[chave] = row.to_dict()
+        except Exception as e:
+            logger.warning(f"Não foi possível ler progresso existente: {e}")
+    return progresso
 
 
 # ==============================================================================
@@ -363,12 +405,14 @@ def executar_pipeline(
     dry_run: bool = False,
     testar_ia: bool = False,
     apenas_ia: bool = False,
+    delay: float = 1.5,
+    esperar_rate_limit: bool = False,
 ) -> pd.DataFrame:
     """
     Executa o fluxo completo do experimento de TCC:
       1. Localiza e valida imagens de entrada (5 IA e 5 Reais)
       2. Gera todas as variações de compressão e formato com Pillow
-      3. Consulta a API de Content Provenance da OpenAI com tqdm e retry
+      3. Consulta a API de Content Provenance da OpenAI com tqdm, retry e checkpointing
       4. Consolida métricas em DataFrame e exporta CSV + SQLite
     """
     logger.info("=" * 70)
@@ -441,8 +485,13 @@ def executar_pipeline(
         logger.info("Opção '--apenas-processar' ativada. Encerrando sem chamar a API.")
         return pd.DataFrame(todas_variacoes)
 
-    # 2. CHAMADAS PARA A API DA OPENAI
-    logger.info(f"\n[ETAPA 2/3] Integrando com a API de Proveniência da OpenAI ({len(todas_variacoes)} chamadas programadas)...")
+    # 2. CHAMADAS PARA A API DA OPENAI (COM CHECKPOINTING / RETOMADA)
+    logger.info(f"\n[ETAPA 2/3] Integrando com a API de Proveniência da OpenAI ({len(todas_variacoes)} amostras)...")
+
+    # Verifica se já temos progresso salvo anteriormente
+    progresso_previo = carregar_progresso_existente(results_dir) if not dry_run else {}
+    if progresso_previo:
+        logger.info(f"Checkpoint detectado: {len(progresso_previo)} amostras válidas já concluídas serão mantidas.")
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     client = None
@@ -464,15 +513,23 @@ def executar_pipeline(
                 dry_run = True
 
     registros_finais: List[Dict[str, Any]] = []
+    novas_requisicoes_feitas = 0
 
-    for item in tqdm(todas_variacoes, desc="Consultando API OpenAI", unit="amostra"):
+    pbar = tqdm(todas_variacoes, desc="Consultando API OpenAI", unit="amostra")
+    for item in pbar:
+        chave_amostra = f"{item['id_imagem']}_{item['categoria']}_{item['formato']}_{item['tipo_compressao']}_{item['nivel_qualidade']}"
+
+        # Se esta amostra já foi concluída com sucesso em uma execução anterior, reaproveita!
+        if chave_amostra in progresso_previo:
+            registros_finais.append(progresso_previo[chave_amostra])
+            continue
+
         caminho_arq = item["caminho_arquivo"]
 
         if dry_run or client is None:
             # Modo Simulado (Dry-Run para testes e validação da estrutura)
             is_ia = item["categoria"] == "IA"
             qualidade = item["nivel_qualidade"]
-            # Exemplo heurístico de degradação em dry-run:
             if is_ia:
                 c2pa_status = "detected" if qualidade in ("Original", "N/A") or (isinstance(qualidade, int) and qualidade >= 40) else "not_detected"
                 synthid_status = "detected" if qualidade in ("Original", "N/A") or (isinstance(qualidade, int) and qualidade >= 20) else "not_detected"
@@ -497,6 +554,53 @@ def executar_pipeline(
         else:
             # Chamada real à API oficial
             resultado_api = verificar_proveniencia_openai(client, caminho_arq)
+            novas_requisicoes_feitas += 1
+
+            # Detecta bloqueio por janela horária (429 Rate Limit de longo prazo)
+            if resultado_api.get("status_api") == "rate_limit_longo":
+                segundos_espera = resultado_api.get("segundos_espera", 3600)
+                hora_liberacao = datetime.now() + timedelta(seconds=segundos_espera)
+                hora_str = hora_liberacao.strftime("%H:%M:%S")
+
+                # Salva imediatamente tudo o que já foi processado com sucesso até aqui
+                if registros_finais:
+                    salvar_resultados(pd.DataFrame(registros_finais), results_dir)
+
+                logger.warning("=" * 70)
+                logger.warning("⚠️  LIMITE DE REQUISIÇÕES POR HORA DA OPENAI ATINGIDO!")
+                logger.warning(
+                    f"A OpenAI exige uma pausa de {segundos_espera/60:.1f} minutos "
+                    f"({segundos_espera:.0f}s). Liberação estimada às: {hora_str}."
+                )
+                logger.warning(
+                    f"Progresso 100% preservado: {len(registros_finais)} de {len(todas_variacoes)} "
+                    f"amostras já estão salvas com segurança em 'results/'."
+                )
+
+                if esperar_rate_limit:
+                    logger.info(f"Argumento '--esperar-rate-limit' ativo. Aguardando contagem regressiva até {hora_str}...")
+                    tempo_restante = int(segundos_espera) + 10
+                    while tempo_restante > 0:
+                        minutos_rest = tempo_restante // 60
+                        segundos_rest = tempo_restante % 60
+                        pbar.set_description(f"Aguardando Rate Limit: {minutos_rest:02d}m{segundos_rest:02d}s")
+                        time.sleep(min(10, tempo_restante))
+                        tempo_restante -= 10
+                    pbar.set_description("Consultando API OpenAI")
+                    # Tenta novamente a mesma amostra após a espera
+                    resultado_api = verificar_proveniencia_openai(client, caminho_arq)
+                else:
+                    logger.warning(
+                        "O script foi pausado com segurança para não sobrecarregar sua conta.\n"
+                        f"Basta executar novamente 'python main.py' por volta das {hora_str} "
+                        "e o experimento continuará exatamente de onde parou!"
+                    )
+                    logger.warning("=" * 70)
+                    break
+
+            # Delay suave entre requisições reais para evitar disparos em rajada
+            if delay > 0:
+                time.sleep(delay)
 
         # Monta linha com campos estritamente obrigatórios no TCC.md
         registro = {
@@ -513,22 +617,26 @@ def executar_pipeline(
         }
         registros_finais.append(registro)
 
-    # 3. CONSOLIDAÇÃO E SALVAMENTO
+        # Salvamento incremental a cada 5 novas requisições para máxima segurança de dados
+        if novas_requisicoes_feitas > 0 and novas_requisicoes_feitas % 5 == 0:
+            salvar_resultados(pd.DataFrame(registros_finais), results_dir)
+
+    # 3. CONSOLIDAÇÃO E SALVAMENTO FINAL
     logger.info("\n[ETAPA 3/3] Consolidando e salvando resultados em CSV e SQLite...")
     df_resultados = pd.DataFrame(registros_finais)
 
     salvar_resultados(df_resultados, results_dir)
 
     logger.info("=" * 70)
-    logger.info("EXPERIMENTO CONCLUÍDO COM SUCESSO!")
-    logger.info(f"Total de registros analisados: {len(df_resultados)}")
+    logger.info(f"Progresso salvo: {len(df_resultados)} de {len(todas_variacoes)} amostras registradas.")
+    logger.info(f"Relatórios atualizados em: {results_dir / 'experimento_tcc.csv'}")
     logger.info("=" * 70)
 
     return df_resultados
 
 
 # ==============================================================================
-# 7. PARSER DE LINHA DE COMANDO (CLI)
+# 6. PARSER DE LINHA DE COMANDO (CLI)
 # ==============================================================================
 
 def main():
@@ -574,6 +682,17 @@ def main():
         action="store_true",
         help="Executa o pipeline completo (com variações de compressão) apenas para as imagens de IA, ignorando as reais.",
     )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.5,
+        help="Intervalo em segundos entre cada requisição para evitar disparos em rajada. Padrão: 1.5s",
+    )
+    parser.add_argument(
+        "--esperar-rate-limit",
+        action="store_true",
+        help="Caso atinja o limite por hora da OpenAI, aguarda a contagem regressiva automaticamente em vez de encerrar.",
+    )
 
     args = parser.parse_args()
 
@@ -585,6 +704,8 @@ def main():
         dry_run=args.dry_run,
         testar_ia=getattr(args, "testar_ia", False),
         apenas_ia=getattr(args, "apenas_ia", False),
+        delay=getattr(args, "delay", 1.5),
+        esperar_rate_limit=getattr(args, "esperar_rate_limit", False),
     )
 
 

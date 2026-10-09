@@ -114,6 +114,8 @@ O script irá:
 | `python main.py --apenas-ia` | Executa o pipeline completo (com as 24 variações de compressão) **apenas para as imagens de IA**, ignorando as fotos reais. |
 | `python main.py --dry-run` | Executa o pipeline simulando as chamadas da API (sem gastar créditos). Ideal para validar o fluxo. |
 | `python main.py --apenas-processar` | Gera apenas as variações e compressões de imagem sem consultar a API da OpenAI. |
+| `python main.py --delay 2.0` | Define o intervalo em segundos entre cada requisição para respeitar o fluxo da API (padrão: 1.5s). |
+| `python main.py --esperar-rate-limit` | Caso atinja a cota horária da OpenAI, o script aguarda automaticamente em contagem regressiva em vez de pausar. |
 | `python main.py --input-dir ./pasta` | Permite customizar a pasta das imagens de entrada. |
 | `python main.py --results-dir ./saida` | Permite customizar a pasta dos relatórios finais. |
 
