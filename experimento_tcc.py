@@ -347,6 +347,11 @@ def verificar_proveniencia_openai(
 # 4. SALVAMENTO E PERSISTÊNCIA DOS DADOS
 # ==============================================================================
 
+def obter_chave_amostra(id_imagem: str, categoria: str, formato: str, tipo_compressao: str, nivel_qualidade: Any) -> str:
+    """Gera chave única padronizada para identificar a variação da amostra."""
+    return f"{id_imagem}_{categoria}_{formato}_{tipo_compressao}_{nivel_qualidade}"
+
+
 def salvar_resultados(df: pd.DataFrame, results_dir: Path) -> Tuple[Path, Path]:
     """
     Exporta o DataFrame com os resultados do experimento para:
@@ -371,26 +376,88 @@ def salvar_resultados(df: pd.DataFrame, results_dir: Path) -> Tuple[Path, Path]:
     return caminho_csv, caminho_db
 
 
-def carregar_progresso_existente(results_dir: Path) -> Dict[str, Dict[str, Any]]:
+def carregar_dados_existentes(results_dir: Path) -> Dict[str, Dict[str, Any]]:
     """
-    Carrega resultados prévios já concluídos com sucesso para evitar retrabalho
-    e permitir que o experimento continue de onde parou após interrupções ou rate limits.
+    Carrega todos os dados já salvos em results/experimento_tcc.csv.
+    Se existirem dados antigos sem data_coleta, preenche com a data de hoje.
+    Garante persistência integral contra quedas de luz e interrupções.
     """
     caminho_csv = results_dir / "experimento_tcc.csv"
-    progresso = {}
+    dados_mestre: Dict[str, Dict[str, Any]] = {}
+    data_hoje_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     if caminho_csv.exists():
         try:
             df_existente = pd.read_csv(caminho_csv)
+            precisa_reescrever = False
+
+            # Se a coluna data_coleta ainda não existir no CSV prévio
+            if "data_coleta" not in df_existente.columns:
+                df_existente["data_coleta"] = data_hoje_str
+                precisa_reescrever = True
+
             for _, row in df_existente.iterrows():
-                outcome_c2pa = str(row.get("c2pa_outcome", ""))
-                outcome_synth = str(row.get("synthid_outcome", ""))
-                # Apenas amostras que não deram erro ou rate limit são reaproveitadas
-                if outcome_c2pa not in ("erro", "rate_limit", "nan", "") and outcome_synth not in ("erro", "rate_limit", "nan", ""):
-                    chave = f"{row['id_imagem']}_{row['categoria']}_{row['formato']}_{row['tipo_compressao']}_{row['nivel_qualidade']}"
-                    progresso[chave] = row.to_dict()
+                row_dict = row.to_dict()
+                # Se data_coleta for nula ou vazia, preenche com a data de hoje
+                data_val = str(row_dict.get("data_coleta", "")).strip()
+                if not data_val or data_val.lower() in ("nan", "none", ""):
+                    row_dict["data_coleta"] = data_hoje_str
+                    precisa_reescrever = True
+
+                chave = obter_chave_amostra(
+                    str(row_dict["id_imagem"]),
+                    str(row_dict["categoria"]),
+                    str(row_dict["formato"]),
+                    str(row_dict["tipo_compressao"]),
+                    str(row_dict["nivel_qualidade"]),
+                )
+                dados_mestre[chave] = row_dict
+
+            # Se atualizamos datas vazias para hoje, já sincroniza o arquivo no disco
+            if precisa_reescrever and dados_mestre:
+                salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir)
+                logger.info(
+                    f"Dados anteriores preservados: {len(dados_mestre)} amostras atualizadas com a data de hoje ({data_hoje_str[:10]})."
+                )
+
         except Exception as e:
-            logger.warning(f"Não foi possível ler progresso existente: {e}")
-    return progresso
+            logger.warning(f"Não foi possível ler dados existentes de {caminho_csv}: {e}")
+
+    return dados_mestre
+
+
+def amostra_esta_recente(registro: Dict[str, Any], max_dias: int = 10, permitir_simulado: bool = False) -> bool:
+    """
+    Verifica se uma amostra foi coletada com sucesso há menos de `max_dias` dias.
+    Retorna True se os dados são recentes e devem ser preservados (não reenviar para a API).
+    Retorna False se não tem data, deu erro, tem mais de `max_dias` dias ou é simulação.
+    """
+    outcome_c2pa = str(registro.get("c2pa_outcome", "")).lower()
+    outcome_synth = str(registro.get("synthid_outcome", "")).lower()
+
+    # Se a tentativa anterior terminou em erro ou rate limit, não é válida
+    if outcome_c2pa in ("erro", "rate_limit", "nan", "") or outcome_synth in ("erro", "rate_limit", "nan", ""):
+        return False
+
+    # No modo oficial com API real, nunca considera dados simulados de dry-run como válidos
+    resp_json = str(registro.get("resposta_bruta_json", "")).lower()
+    if not permitir_simulado and '"simulado": true' in resp_json:
+        return False
+
+    data_str = str(registro.get("data_coleta", "")).strip()
+    if not data_str or data_str.lower() in ("nan", "none"):
+        return False
+
+    try:
+        if len(data_str) >= 19:
+            data_dt = datetime.strptime(data_str[:19], "%Y-%m-%d %H:%M:%S")
+        else:
+            data_dt = datetime.strptime(data_str[:10], "%Y-%m-%d")
+
+        dias_decorridos = (datetime.now() - data_dt).total_seconds() / 86400.0
+        return dias_decorridos <= max_dias
+    except Exception:
+        return False
 
 
 # ==============================================================================
@@ -412,8 +479,8 @@ def executar_pipeline(
     Executa o fluxo completo do experimento de TCC:
       1. Localiza e valida imagens de entrada (5 IA e 5 Reais)
       2. Gera todas as variações de compressão e formato com Pillow
-      3. Consulta a API de Content Provenance da OpenAI com tqdm, retry e checkpointing
-      4. Consolida métricas em DataFrame e exporta CSV + SQLite
+      3. Consulta a API de Content Provenance da OpenAI com tqdm, retry e checkpointing de 10 dias
+      4. Consolida métricas em DataFrame e exporta CSV + SQLite com data_coleta
     """
     logger.info("=" * 70)
     if testar_ia:
@@ -485,13 +552,47 @@ def executar_pipeline(
         logger.info("Opção '--apenas-processar' ativada. Encerrando sem chamar a API.")
         return pd.DataFrame(todas_variacoes)
 
-    # 2. CHAMADAS PARA A API DA OPENAI (COM CHECKPOINTING / RETOMADA)
+    # 2. CHAMADAS PARA A API DA OPENAI (COM CONTROLE DE 10 DIAS E CHECKPOINTING MESTRE)
     logger.info(f"\n[ETAPA 2/3] Integrando com a API de Proveniência da OpenAI ({len(todas_variacoes)} amostras)...")
 
-    # Verifica se já temos progresso salvo anteriormente
-    progresso_previo = carregar_progresso_existente(results_dir) if not dry_run else {}
-    if progresso_previo:
-        logger.info(f"Checkpoint detectado: {len(progresso_previo)} amostras válidas já concluídas serão mantidas.")
+    # Carrega dados mestre existentes garantindo integridade e preenchendo datas anteriores
+    dados_mestre = carregar_dados_existentes(results_dir) if not dry_run else {}
+
+    # Avalia quantas amostras já estão coletadas e válidas há menos de 10 dias
+    amostras_recentes_poupadas = 0
+    amostras_para_processar = []
+
+    for item in todas_variacoes:
+        chave = obter_chave_amostra(
+            item["id_imagem"],
+            item["categoria"],
+            item["formato"],
+            item["tipo_compressao"],
+            item["nivel_qualidade"],
+        )
+        if chave in dados_mestre and amostra_esta_recente(dados_mestre[chave], max_dias=10, permitir_simulado=dry_run):
+            amostras_recentes_poupadas += 1
+        else:
+            amostras_para_processar.append(item)
+
+    logger.info(
+        f"📊 Status do Dataset:\n"
+        f"   - Total de amostras no experimento: {len(todas_variacoes)}\n"
+        f"   - Coletadas recentemente (< 10 dias) mantidas: {amostras_recentes_poupadas}\n"
+        f"   - Pendentes para consulta na API (novas ou > 10 dias): {len(amostras_para_processar)}"
+    )
+
+    if not amostras_para_processar:
+        logger.info("🎉 Todas as amostras já possuem dados coletados há menos de 10 dias! Nenhum envio à API necessário.")
+        # Retorna o DataFrame ordenado
+        lista_ordenada = [
+            dados_mestre[obter_chave_amostra(it["id_imagem"], it["categoria"], it["formato"], it["tipo_compressao"], it["nivel_qualidade"])]
+            for it in todas_variacoes
+            if obter_chave_amostra(it["id_imagem"], it["categoria"], it["formato"], it["tipo_compressao"], it["nivel_qualidade"]) in dados_mestre
+        ]
+        df_completo = pd.DataFrame(lista_ordenada)
+        salvar_resultados(df_completo, results_dir)
+        return df_completo
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     client = None
@@ -512,18 +613,15 @@ def executar_pipeline(
                 logger.error(f"Erro ao instanciar cliente da OpenAI: {e}")
                 dry_run = True
 
-    registros_finais: List[Dict[str, Any]] = []
-    novas_requisicoes_feitas = 0
-
-    pbar = tqdm(todas_variacoes, desc="Consultando API OpenAI", unit="amostra")
+    pbar = tqdm(amostras_para_processar, desc="Consultando API OpenAI", unit="amostra")
     for item in pbar:
-        chave_amostra = f"{item['id_imagem']}_{item['categoria']}_{item['formato']}_{item['tipo_compressao']}_{item['nivel_qualidade']}"
-
-        # Se esta amostra já foi concluída com sucesso em uma execução anterior, reaproveita!
-        if chave_amostra in progresso_previo:
-            registros_finais.append(progresso_previo[chave_amostra])
-            continue
-
+        chave_amostra = obter_chave_amostra(
+            item["id_imagem"],
+            item["categoria"],
+            item["formato"],
+            item["tipo_compressao"],
+            item["nivel_qualidade"],
+        )
         caminho_arq = item["caminho_arquivo"]
 
         if dry_run or client is None:
@@ -551,10 +649,11 @@ def executar_pipeline(
                 }),
                 "status_api": "simulado_dry_run"
             }
+            data_devolucao = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         else:
             # Chamada real à API oficial
             resultado_api = verificar_proveniencia_openai(client, caminho_arq)
-            novas_requisicoes_feitas += 1
+            data_devolucao = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             # Detecta bloqueio por janela horária (429 Rate Limit de longo prazo)
             if resultado_api.get("status_api") == "rate_limit_longo":
@@ -562,9 +661,9 @@ def executar_pipeline(
                 hora_liberacao = datetime.now() + timedelta(seconds=segundos_espera)
                 hora_str = hora_liberacao.strftime("%H:%M:%S")
 
-                # Salva imediatamente tudo o que já foi processado com sucesso até aqui
-                if registros_finais:
-                    salvar_resultados(pd.DataFrame(registros_finais), results_dir)
+                # Salva imediatamente TODO o dados_mestre (mantém 100% dos dados anteriores e atuais)
+                if dados_mestre:
+                    salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir)
 
                 logger.warning("=" * 70)
                 logger.warning("⚠️  LIMITE DE REQUISIÇÕES POR HORA DA OPENAI ATINGIDO!")
@@ -573,8 +672,7 @@ def executar_pipeline(
                     f"({segundos_espera:.0f}s). Liberação estimada às: {hora_str}."
                 )
                 logger.warning(
-                    f"Progresso 100% preservado: {len(registros_finais)} de {len(todas_variacoes)} "
-                    f"amostras já estão salvas com segurança em 'results/'."
+                    f"Progresso 100% preservado no disco: {len(dados_mestre)} amostras salvas em 'results/'."
                 )
 
                 if esperar_rate_limit:
@@ -589,11 +687,12 @@ def executar_pipeline(
                     pbar.set_description("Consultando API OpenAI")
                     # Tenta novamente a mesma amostra após a espera
                     resultado_api = verificar_proveniencia_openai(client, caminho_arq)
+                    data_devolucao = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 else:
                     logger.warning(
                         "O script foi pausado com segurança para não sobrecarregar sua conta.\n"
-                        f"Basta executar novamente 'python main.py' por volta das {hora_str} "
-                        "e o experimento continuará exatamente de onde parou!"
+                        f"Basta executar novamente 'python main.py --esperar-rate-limit' por volta das {hora_str} "
+                        "e o experimento continuará exatamente de onde parou sem repetir nada!"
                     )
                     logger.warning("=" * 70)
                     break
@@ -602,7 +701,7 @@ def executar_pipeline(
             if delay > 0:
                 time.sleep(delay)
 
-        # Monta linha com campos estritamente obrigatórios no TCC.md
+        # Monta linha com campos obrigatórios + data_coleta
         registro = {
             "id_imagem": item["id_imagem"],
             "categoria": item["categoria"],
@@ -614,21 +713,28 @@ def executar_pipeline(
             "c2pa_issuer": resultado_api["c2pa_issuer"],
             "synthid_outcome": resultado_api["synthid_outcome"],
             "resposta_bruta_json": resultado_api["resposta_bruta_json"],
+            "data_coleta": data_devolucao,
         }
-        registros_finais.append(registro)
 
-        # Salvamento incremental a cada 5 novas requisições para máxima segurança de dados
-        if novas_requisicoes_feitas > 0 and novas_requisicoes_feitas % 5 == 0:
-            salvar_resultados(pd.DataFrame(registros_finais), results_dir)
+        # Atualiza a amostra no dicionário mestre (não perde nenhuma amostra prévia!)
+        dados_mestre[chave_amostra] = registro
 
-    # 3. CONSOLIDAÇÃO E SALVAMENTO FINAL
-    logger.info("\n[ETAPA 3/3] Consolidando e salvando resultados em CSV e SQLite...")
-    df_resultados = pd.DataFrame(registros_finais)
+        # SALVAMENTO IMEDIATO A CADA NOVA REQUISIÇÃO: Proteção total contra quedas de luz!
+        salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir)
 
+    # 3. CONSOLIDAÇÃO E SALVAMENTO FINAL (ORDENADO CONFORME O DATASET)
+    logger.info("\n[ETAPA 3/3] Consolidando e ordenando resultados finais em CSV e SQLite...")
+    lista_final = []
+    for it in todas_variacoes:
+        ch = obter_chave_amostra(it["id_imagem"], it["categoria"], it["formato"], it["tipo_compressao"], it["nivel_qualidade"])
+        if ch in dados_mestre:
+            lista_final.append(dados_mestre[ch])
+
+    df_resultados = pd.DataFrame(lista_final if lista_final else list(dados_mestre.values()))
     salvar_resultados(df_resultados, results_dir)
 
     logger.info("=" * 70)
-    logger.info(f"Progresso salvo: {len(df_resultados)} de {len(todas_variacoes)} amostras registradas.")
+    logger.info(f"Progresso consolidado: {len(df_resultados)} de {len(todas_variacoes)} amostras salvas.")
     logger.info(f"Relatórios atualizados em: {results_dir / 'experimento_tcc.csv'}")
     logger.info("=" * 70)
 

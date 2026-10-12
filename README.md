@@ -137,3 +137,16 @@ O arquivo `results/experimento_tcc.csv` e a tabela `experimento_tcc` no `results
 | `c2pa_issuer` | Emissor do manifesto C2PA (ex: OpenAI, quando disponível) |
 | `synthid_outcome` | Resultado SynthID (`detected`, `not_detected`, `erro`) |
 | `resposta_bruta_json` | JSON completo retornado pela API para auditoria científica |
+| `data_coleta` | Data e hora em que a amostra foi devolvida pela API (usada para o controle de expiração de 10 dias) |
+
+---
+
+## 🛡️ Tolerância a Falhas e Regra de Validade de 10 Dias
+
+O algoritmo possui um sistema de persistência mestre à prova de quedas de energia e interrupções:
+
+1. **Salvamento Imediato:** Cada requisição concluída com sucesso é gravada instantaneamente no CSV e no SQLite. Se a energia cair ou o processo for interrompido, nenhum dado prévio é perdido.
+2. **Janela de Validade de 10 Dias:** Ao iniciar ou reiniciar o script (ex: com `python main.py --esperar-rate-limit`), o sistema analisa as amostras já salvas no disco:
+   * **Amostras com menos de 10 dias:** São consideradas válidas e **não são reenviadas** para a API, preservando suas cotas e créditos.
+   * **Amostras com mais de 10 dias (ou inexistentes):** São identificadas como pendentes e enviadas para a API para atualização dos dados.
+3. **Migração Automática:** Amostras de execuções anteriores que não possuíam data recebem automaticamente a data do dia corrente como data de aquisição.
