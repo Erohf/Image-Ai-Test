@@ -352,15 +352,15 @@ def obter_chave_amostra(id_imagem: str, categoria: str, formato: str, tipo_compr
     return f"{id_imagem}_{categoria}_{formato}_{tipo_compressao}_{nivel_qualidade}"
 
 
-def salvar_resultados(df: pd.DataFrame, results_dir: Path) -> Tuple[Path, Path]:
+def salvar_resultados(df: pd.DataFrame, results_dir: Path, nome_base: str = "experimento_tcc") -> Tuple[Path, Path]:
     """
     Exporta o DataFrame com os resultados do experimento para:
-      1. Arquivo CSV: /results/experimento_tcc.csv
-      2. Banco SQLite: /results/experimento_tcc.db (tabela: experimento_tcc)
+      1. Arquivo CSV: /results/{nome_base}.csv
+      2. Banco SQLite: /results/{nome_base}.db (tabela: {nome_base})
     """
     results_dir.mkdir(parents=True, exist_ok=True)
-    caminho_csv = results_dir / "experimento_tcc.csv"
-    caminho_db = results_dir / "experimento_tcc.db"
+    caminho_csv = results_dir / f"{nome_base}.csv"
+    caminho_db = results_dir / f"{nome_base}.db"
 
     # 1. Salva CSV em UTF-8 com formatação limpa
     df.to_csv(caminho_csv, index=False, encoding="utf-8-sig")
@@ -368,7 +368,7 @@ def salvar_resultados(df: pd.DataFrame, results_dir: Path) -> Tuple[Path, Path]:
     # 2. Salva em banco SQLite
     try:
         conn = sqlite3.connect(caminho_db)
-        df.to_sql("experimento_tcc", conn, if_exists="replace", index=False)
+        df.to_sql(nome_base, conn, if_exists="replace", index=False)
         conn.close()
     except Exception as e:
         logger.error(f"Erro ao salvar dados no SQLite ({caminho_db}): {e}", exc_info=True)
@@ -558,8 +558,11 @@ def executar_pipeline(
     # Carrega dados mestre existentes garantindo integridade e preenchendo datas anteriores
     dados_mestre = carregar_dados_existentes(results_dir) if not dry_run else {}
 
+    nome_base = "experimento_tcc_dryrun" if dry_run else "experimento_tcc"
+
     # Avalia quantas amostras já estão coletadas e válidas há menos de 10 dias
     amostras_recentes_poupadas = 0
+    amostras_simuladas_ignoradas = 0
     amostras_para_processar = []
 
     for item in todas_variacoes:
@@ -570,17 +573,28 @@ def executar_pipeline(
             item["tipo_compressao"],
             item["nivel_qualidade"],
         )
-        if chave in dados_mestre and amostra_esta_recente(dados_mestre[chave], max_dias=10, permitir_simulado=dry_run):
-            amostras_recentes_poupadas += 1
+        if chave in dados_mestre:
+            registro_existente = dados_mestre[chave]
+            if amostra_esta_recente(registro_existente, max_dias=10, permitir_simulado=dry_run):
+                amostras_recentes_poupadas += 1
+            else:
+                if not dry_run and '"simulado": true' in str(registro_existente.get("resposta_bruta_json", "")).lower():
+                    amostras_simuladas_ignoradas += 1
+                amostras_para_processar.append(item)
         else:
             amostras_para_processar.append(item)
 
-    logger.info(
+    status_log = (
         f"📊 Status do Dataset:\n"
         f"   - Total de amostras no experimento: {len(todas_variacoes)}\n"
         f"   - Coletadas recentemente (< 10 dias) mantidas: {amostras_recentes_poupadas}\n"
         f"   - Pendentes para consulta na API (novas ou > 10 dias): {len(amostras_para_processar)}"
     )
+    if amostras_simuladas_ignoradas > 0:
+        status_log += (
+            f"\n   ℹ️  {amostras_simuladas_ignoradas} amostras possuem dados prévios de simulação (dry-run) e serão consultadas na API real para integridade do TCC."
+        )
+    logger.info(status_log)
 
     if not amostras_para_processar:
         logger.info("🎉 Todas as amostras já possuem dados coletados há menos de 10 dias! Nenhum envio à API necessário.")
@@ -591,7 +605,7 @@ def executar_pipeline(
             if obter_chave_amostra(it["id_imagem"], it["categoria"], it["formato"], it["tipo_compressao"], it["nivel_qualidade"]) in dados_mestre
         ]
         df_completo = pd.DataFrame(lista_ordenada)
-        salvar_resultados(df_completo, results_dir)
+        salvar_resultados(df_completo, results_dir, nome_base=nome_base)
         return df_completo
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -663,7 +677,7 @@ def executar_pipeline(
 
                 # Salva imediatamente TODO o dados_mestre (mantém 100% dos dados anteriores e atuais)
                 if dados_mestre:
-                    salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir)
+                    salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir, nome_base=nome_base)
 
                 logger.warning("=" * 70)
                 logger.warning("⚠️  LIMITE DE REQUISIÇÕES POR HORA DA OPENAI ATINGIDO!")
@@ -720,7 +734,7 @@ def executar_pipeline(
         dados_mestre[chave_amostra] = registro
 
         # SALVAMENTO IMEDIATO A CADA NOVA REQUISIÇÃO: Proteção total contra quedas de luz!
-        salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir)
+        salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir, nome_base=nome_base)
 
     # 3. CONSOLIDAÇÃO E SALVAMENTO FINAL (ORDENADO CONFORME O DATASET)
     logger.info("\n[ETAPA 3/3] Consolidando e ordenando resultados finais em CSV e SQLite...")
@@ -731,11 +745,11 @@ def executar_pipeline(
             lista_final.append(dados_mestre[ch])
 
     df_resultados = pd.DataFrame(lista_final if lista_final else list(dados_mestre.values()))
-    salvar_resultados(df_resultados, results_dir)
+    salvar_resultados(df_resultados, results_dir, nome_base=nome_base)
 
     logger.info("=" * 70)
     logger.info(f"Progresso consolidado: {len(df_resultados)} de {len(todas_variacoes)} amostras salvas.")
-    logger.info(f"Relatórios atualizados em: {results_dir / 'experimento_tcc.csv'}")
+    logger.info(f"Relatórios atualizados em: {results_dir / f'{nome_base}.csv'}")
     logger.info("=" * 70)
 
     return df_resultados
