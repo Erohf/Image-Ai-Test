@@ -106,14 +106,15 @@ def gerar_variacoes_imagem(
     caminho_origem: Path,
     id_imagem: str,
     categoria: str,
-    output_dir: Path
+    output_dir: Path,
+    qualidades_lossy: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Gera todas as variações de compressão e formato especificadas no TCC:
-      - JPEG (Lossy): qualidade de 0% a 100% de 10 em 10 (0, 10, ..., 100)
+      - JPEG (Lossy): qualidades definidas por qualidades_lossy (padrão: 0% a 100% de 10 em 10)
       - PNG (Lossless): preservação total de dados (baseline)
       - WebP (Lossless): preservação total de dados (baseline)
-      - WebP (Lossy): qualidade de 0% a 100% de 10 em 10 (0, 10, ..., 100)
+      - WebP (Lossy): qualidades definidas por qualidades_lossy (padrão: 0% a 100% de 10 em 10)
       - Imagem Original: incluída como referência de baseline
 
     Nomenclatura:
@@ -121,6 +122,9 @@ def gerar_variacoes_imagem(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     variacoes_geradas: List[Dict[str, Any]] = []
+
+    if qualidades_lossy is None:
+        qualidades_lossy = list(range(0, 101, 10))
 
     try:
         with Image.open(caminho_origem) as img_original:
@@ -142,8 +146,8 @@ def gerar_variacoes_imagem(
             # Prepara versão RGB para formatos que exigem 3 canais (ex: JPEG)
             img_rgb = converter_para_rgb_se_necessario(img_original)
 
-            # 2. Variações JPEG (Lossy): 0% a 100% de 10 em 10
-            for q in range(0, 101, 10):
+            # 2. Variações JPEG (Lossy)
+            for q in qualidades_lossy:
                 nome_arq = f"{id_imagem}_{categoria}_jpeg_q{q}.jpg"
                 caminho_saida = output_dir / nome_arq
                 img_rgb.save(caminho_saida, format="JPEG", quality=q)
@@ -185,8 +189,8 @@ def gerar_variacoes_imagem(
                 "caminho_arquivo": caminho_webp_ll,
             })
 
-            # 5. Variações WebP (Lossy): 0% a 100% de 10 em 10
-            for q in range(0, 101, 10):
+            # 5. Variações WebP (Lossy)
+            for q in qualidades_lossy:
                 nome_webp_lossy = f"{id_imagem}_{categoria}_webp_lossy_q{q}.webp"
                 caminho_webp_lossy = output_dir / nome_webp_lossy
                 img_original.save(caminho_webp_lossy, format="WEBP", quality=q, lossless=False)
@@ -352,43 +356,71 @@ def obter_chave_amostra(id_imagem: str, categoria: str, formato: str, tipo_compr
     return f"{id_imagem}_{categoria}_{formato}_{tipo_compressao}_{nivel_qualidade}"
 
 
-def salvar_resultados(df: pd.DataFrame, results_dir: Path, nome_base: str = "experimento_tcc") -> Tuple[Path, Path]:
+def salvar_resultados(
+    df: pd.DataFrame,
+    results_dir: Path,
+    nome_base: str = "experimento_tcc",
+    nome_tabela: Optional[str] = None,
+) -> Tuple[Path, Path]:
     """
     Exporta o DataFrame com os resultados do experimento para:
       1. Arquivo CSV: /results/{nome_base}.csv
-      2. Banco SQLite: /results/{nome_base}.db (tabela: {nome_base})
+      2. Banco SQLite principal: /results/experimento_tcc.db (tabela: {nome_tabela})
+      3. Banco SQLite específico: /results/{nome_base}.db (se nome_base != 'experimento_tcc')
     """
     results_dir.mkdir(parents=True, exist_ok=True)
     caminho_csv = results_dir / f"{nome_base}.csv"
-    caminho_db = results_dir / f"{nome_base}.db"
+    tabela = nome_tabela if nome_tabela else nome_base
 
     # 1. Salva CSV em UTF-8 com formatação limpa
     df.to_csv(caminho_csv, index=False, encoding="utf-8-sig")
 
-    # 2. Salva em banco SQLite
+    # 2. Salva a nova tabela no banco principal (experimento_tcc.db) garantindo coexistência de tabelas
+    caminho_db_principal = results_dir / "experimento_tcc.db"
     try:
-        conn = sqlite3.connect(caminho_db)
-        df.to_sql(nome_base, conn, if_exists="replace", index=False)
+        conn = sqlite3.connect(caminho_db_principal)
+        df.to_sql(tabela, conn, if_exists="replace", index=False)
         conn.close()
     except Exception as e:
-        logger.error(f"Erro ao salvar dados no SQLite ({caminho_db}): {e}", exc_info=True)
+        logger.error(f"Erro ao salvar tabela '{tabela}' no SQLite principal ({caminho_db_principal}): {e}", exc_info=True)
 
-    return caminho_csv, caminho_db
+    # 3. Salva também no banco específico com o mesmo nome do CSV
+    caminho_db_especifico = results_dir / f"{nome_base}.db"
+    if caminho_db_especifico.resolve() != caminho_db_principal.resolve():
+        try:
+            conn = sqlite3.connect(caminho_db_especifico)
+            df.to_sql(tabela, conn, if_exists="replace", index=False)
+            conn.close()
+        except Exception as e:
+            logger.error(f"Erro ao salvar dados no SQLite específico ({caminho_db_especifico}): {e}", exc_info=True)
+
+    return caminho_csv, caminho_db_principal
 
 
-def carregar_dados_existentes(results_dir: Path) -> Dict[str, Dict[str, Any]]:
+def carregar_dados_existentes(results_dir: Path, nome_base: str = "experimento_tcc") -> Dict[str, Dict[str, Any]]:
     """
-    Carrega todos os dados já salvos em results/experimento_tcc.csv.
+    Carrega todos os dados já salvos em results/{nome_base}.csv.
+    Se o arquivo específico da nova tabela não existir, tenta herdar amostras reais e recentes
+    do experimento principal (experimento_tcc.csv) para poupar requisições (ex: imagens originais baseline).
     Se existirem dados antigos sem data_coleta, preenche com a data de hoje.
     Garante persistência integral contra quedas de luz e interrupções.
     """
-    caminho_csv = results_dir / "experimento_tcc.csv"
+    caminho_csv = results_dir / f"{nome_base}.csv"
     dados_mestre: Dict[str, Dict[str, Any]] = {}
     data_hoje_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    if caminho_csv.exists():
+    caminho_leitura = caminho_csv
+    herdou_do_principal = False
+
+    if not caminho_leitura.exists() and nome_base != "experimento_tcc":
+        caminho_principal = results_dir / "experimento_tcc.csv"
+        if caminho_principal.exists():
+            caminho_leitura = caminho_principal
+            herdou_do_principal = True
+
+    if caminho_leitura.exists():
         try:
-            df_existente = pd.read_csv(caminho_csv)
+            df_existente = pd.read_csv(caminho_leitura)
             precisa_reescrever = False
 
             # Se a coluna data_coleta ainda não existir no CSV prévio
@@ -411,17 +443,28 @@ def carregar_dados_existentes(results_dir: Path) -> Dict[str, Dict[str, Any]]:
                     str(row_dict["tipo_compressao"]),
                     str(row_dict["nivel_qualidade"]),
                 )
-                dados_mestre[chave] = row_dict
 
-            # Se atualizamos datas vazias para hoje, já sincroniza o arquivo no disco
-            if precisa_reescrever and dados_mestre:
-                salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir)
+                if herdou_do_principal:
+                    # Só herda se for dado autêntico e recente (<10 dias)
+                    if amostra_esta_recente(row_dict, max_dias=10, permitir_simulado=False):
+                        dados_mestre[chave] = row_dict
+                else:
+                    dados_mestre[chave] = row_dict
+
+            if herdou_do_principal and dados_mestre:
+                logger.info(
+                    f"Aproveitadas {len(dados_mestre)} amostras reais (< 10 dias) do experimento principal para '{nome_base}'."
+                )
+
+            # Se atualizamos datas vazias para hoje no arquivo próprio, já sincroniza o arquivo no disco
+            if precisa_reescrever and not herdou_do_principal and dados_mestre:
+                salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir, nome_base=nome_base)
                 logger.info(
                     f"Dados anteriores preservados: {len(dados_mestre)} amostras atualizadas com a data de hoje ({data_hoje_str[:10]})."
                 )
 
         except Exception as e:
-            logger.warning(f"Não foi possível ler dados existentes de {caminho_csv}: {e}")
+            logger.warning(f"Não foi possível ler dados existentes de {caminho_leitura}: {e}")
 
     return dados_mestre
 
@@ -474,6 +517,7 @@ def executar_pipeline(
     apenas_ia: bool = False,
     delay: float = 1.5,
     esperar_rate_limit: bool = False,
+    qualidade_1_10: bool = False,
 ) -> pd.DataFrame:
     """
     Executa o fluxo completo do experimento de TCC:
@@ -485,10 +529,15 @@ def executar_pipeline(
     logger.info("=" * 70)
     if testar_ia:
         logger.info("INICIANDO TESTE PILOTO: APENAS IMAGENS ORIGINAIS DE IA (INPUT_IMAGES)")
+    elif qualidade_1_10:
+        if apenas_ia:
+            logger.info("INICIANDO PIPELINE: APENAS IA COM QUALIDADE 1-10 (TABELA: experimento_tcc_q1_10)")
+        else:
+            logger.info("INICIANDO PIPELINE: EXPERIMENTO QUALIDADE 1-10 (TABELA: experimento_tcc_q1_10)")
     elif apenas_ia:
-        logger.info("INICIANDO PIPELINE: APENAS CATEGORIA IA (COM COMPRESSÕES)")
+        logger.info("INICIANDO PIPELINE: APENAS CATEGORIA IA (COM COMPRESSÕES 0-100)")
     else:
-        logger.info("INICIANDO PIPELINE DO EXPERIMENTO DE TCC (IA + REAIS)")
+        logger.info("INICIANDO PIPELINE DO EXPERIMENTO DE TCC (IA + REAIS - QUALIDADES 0-100)")
     logger.info("=" * 70)
 
     # Coleta arquivos de imagem de entrada
@@ -520,6 +569,7 @@ def executar_pipeline(
 
     # 1. GERAÇÃO DE VARIAÇÕES OU TESTE DIRETO DAS ORIGINAIS
     todas_variacoes: List[Dict[str, Any]] = []
+    qualidades_lossy = list(range(1, 11)) if qualidade_1_10 else list(range(0, 101, 10))
 
     if testar_ia:
         logger.info("\n[ETAPA 1/3] Modo '--testar-ia': Pulando compressões e usando imagens originais diretamente...")
@@ -535,14 +585,20 @@ def executar_pipeline(
                 "caminho_arquivo": caminho_img,
             })
     else:
-        logger.info("\n[ETAPA 1/3] Gerando variações de compressão (JPEG, WebP, PNG)...")
+        rotulo_etapa = (
+            "Gerando variações com qualidade 1 a 10 (JPEG, WebP, PNG)..."
+            if qualidade_1_10 else
+            "Gerando variações de compressão (JPEG, WebP, PNG)..."
+        )
+        logger.info(f"\n[ETAPA 1/3] {rotulo_etapa}")
         for caminho_img in tqdm(arquivos_entrada, desc="Processando compressões", unit="imagem"):
             id_imagem, categoria = identificar_categoria_e_id(caminho_img)
             variacoes = gerar_variacoes_imagem(
                 caminho_origem=caminho_img,
                 id_imagem=id_imagem,
                 categoria=categoria,
-                output_dir=processed_dir
+                output_dir=processed_dir,
+                qualidades_lossy=qualidades_lossy,
             )
             todas_variacoes.extend(variacoes)
 
@@ -555,10 +611,15 @@ def executar_pipeline(
     # 2. CHAMADAS PARA A API DA OPENAI (COM CONTROLE DE 10 DIAS E CHECKPOINTING MESTRE)
     logger.info(f"\n[ETAPA 2/3] Integrando com a API de Proveniência da OpenAI ({len(todas_variacoes)} amostras)...")
 
-    # Carrega dados mestre existentes garantindo integridade e preenchendo datas anteriores
-    dados_mestre = carregar_dados_existentes(results_dir) if not dry_run else {}
+    if qualidade_1_10:
+        nome_base = "experimento_tcc_q1_10_dryrun" if dry_run else "experimento_tcc_q1_10"
+        nome_tabela = "experimento_tcc_q1_10"
+    else:
+        nome_base = "experimento_tcc_dryrun" if dry_run else "experimento_tcc"
+        nome_tabela = "experimento_tcc"
 
-    nome_base = "experimento_tcc_dryrun" if dry_run else "experimento_tcc"
+    # Carrega dados mestre existentes garantindo integridade e preenchendo datas anteriores
+    dados_mestre = carregar_dados_existentes(results_dir, nome_base=nome_base) if not dry_run else {}
 
     # Avalia quantas amostras já estão coletadas e válidas há menos de 10 dias
     amostras_recentes_poupadas = 0
@@ -585,7 +646,7 @@ def executar_pipeline(
             amostras_para_processar.append(item)
 
     status_log = (
-        f"📊 Status do Dataset:\n"
+        f"📊 Status do Dataset ({nome_tabela}):\n"
         f"   - Total de amostras no experimento: {len(todas_variacoes)}\n"
         f"   - Coletadas recentemente (< 10 dias) mantidas: {amostras_recentes_poupadas}\n"
         f"   - Pendentes para consulta na API (novas ou > 10 dias): {len(amostras_para_processar)}"
@@ -605,7 +666,7 @@ def executar_pipeline(
             if obter_chave_amostra(it["id_imagem"], it["categoria"], it["formato"], it["tipo_compressao"], it["nivel_qualidade"]) in dados_mestre
         ]
         df_completo = pd.DataFrame(lista_ordenada)
-        salvar_resultados(df_completo, results_dir, nome_base=nome_base)
+        salvar_resultados(df_completo, results_dir, nome_base=nome_base, nome_tabela=nome_tabela)
         return df_completo
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -677,7 +738,7 @@ def executar_pipeline(
 
                 # Salva imediatamente TODO o dados_mestre (mantém 100% dos dados anteriores e atuais)
                 if dados_mestre:
-                    salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir, nome_base=nome_base)
+                    salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir, nome_base=nome_base, nome_tabela=nome_tabela)
 
                 logger.warning("=" * 70)
                 logger.warning("⚠️  LIMITE DE REQUISIÇÕES POR HORA DA OPENAI ATINGIDO!")
@@ -734,7 +795,7 @@ def executar_pipeline(
         dados_mestre[chave_amostra] = registro
 
         # SALVAMENTO IMEDIATO A CADA NOVA REQUISIÇÃO: Proteção total contra quedas de luz!
-        salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir, nome_base=nome_base)
+        salvar_resultados(pd.DataFrame(list(dados_mestre.values())), results_dir, nome_base=nome_base, nome_tabela=nome_tabela)
 
     # 3. CONSOLIDAÇÃO E SALVAMENTO FINAL (ORDENADO CONFORME O DATASET)
     logger.info("\n[ETAPA 3/3] Consolidando e ordenando resultados finais em CSV e SQLite...")
@@ -745,11 +806,12 @@ def executar_pipeline(
             lista_final.append(dados_mestre[ch])
 
     df_resultados = pd.DataFrame(lista_final if lista_final else list(dados_mestre.values()))
-    salvar_resultados(df_resultados, results_dir, nome_base=nome_base)
+    salvar_resultados(df_resultados, results_dir, nome_base=nome_base, nome_tabela=nome_tabela)
 
     logger.info("=" * 70)
     logger.info(f"Progresso consolidado: {len(df_resultados)} de {len(todas_variacoes)} amostras salvas.")
-    logger.info(f"Relatórios atualizados em: {results_dir / f'{nome_base}.csv'}")
+    logger.info(f"Relatório CSV salvo em: {results_dir / f'{nome_base}.csv'}")
+    logger.info(f"Banco SQLite atualizado em: {results_dir / 'experimento_tcc.db'} (Tabela: '{nome_tabela}')")
     logger.info("=" * 70)
 
     return df_resultados
@@ -800,7 +862,19 @@ def main():
     parser.add_argument(
         "--apenas-ia",
         action="store_true",
-        help="Executa o pipeline completo (com variações de compressão) apenas para as imagens de IA, ignorando as reais.",
+        help="Executa o pipeline completo apenas para as imagens de IA, ignorando as reais.",
+    )
+    parser.add_argument(
+        "--qualidade-1-10",
+        dest="qualidade_1_10",
+        action="store_true",
+        help="Executa o experimento com escala de qualidade 1 a 10 (passo 1) em vez de 0 a 100 (passo 10), salvando na tabela 'experimento_tcc_q1_10'.",
+    )
+    parser.add_argument(
+        "--escala-1-10",
+        dest="qualidade_1_10",
+        action="store_true",
+        help="Alias para --qualidade-1-10.",
     )
     parser.add_argument(
         "--delay",
@@ -816,9 +890,15 @@ def main():
 
     args = parser.parse_args()
 
+    processed_dir = args.processed_dir
+    # Se o modo qualidade 1-10 estiver ativo e o diretório não tiver sido modificado pelo usuário,
+    # isola as imagens geradas em processed_images_q1_10
+    if getattr(args, "qualidade_1_10", False) and processed_dir == Path("./processed_images"):
+        processed_dir = Path("./processed_images_q1_10")
+
     executar_pipeline(
         input_dir=args.input_dir,
-        processed_dir=args.processed_dir,
+        processed_dir=processed_dir,
         results_dir=args.results_dir,
         apenas_processar=args.apenas_processar,
         dry_run=args.dry_run,
@@ -826,6 +906,7 @@ def main():
         apenas_ia=getattr(args, "apenas_ia", False),
         delay=getattr(args, "delay", 1.5),
         esperar_rate_limit=getattr(args, "esperar_rate_limit", False),
+        qualidade_1_10=getattr(args, "qualidade_1_10", False),
     )
 
 

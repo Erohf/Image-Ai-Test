@@ -110,14 +110,31 @@ O script irá:
 
 | Comando | Descrição |
 | :--- | :--- |
+| `python main.py --qualidade-1-10` | **Novo Modo (Qualidade 1 a 10):** Testa as imagens com qualidades de 1 a 10 (passo de 1 em 1) em vez de 0 a 100 (passo 10). Salva automaticamente na nova tabela `experimento_tcc_q1_10` dentro do banco `experimento_tcc.db` e exporta `results/experimento_tcc_q1_10.csv`. As imagens ficam isoladas em `processed_images_q1_10/`. |
 | `python main.py --testar-ia` | **Teste Piloto:** Chama a API **somente para as 5 imagens originais de IA** em `input_images` (sem variações de compressão). Ideal para validar detecção inicial e monitorar custos. |
-| `python main.py --apenas-ia` | Executa o pipeline completo (com as 24 variações de compressão) **apenas para as imagens de IA**, ignorando as fotos reais. |
+| `python main.py --apenas-ia` | Executa o pipeline completo apenas para as imagens de IA, ignorando as fotos reais. Pode ser combinado com `--qualidade-1-10`. |
 | `python main.py --dry-run` | Executa o pipeline simulando as chamadas da API (sem gastar créditos). Ideal para validar o fluxo. |
 | `python main.py --apenas-processar` | Gera apenas as variações e compressões de imagem sem consultar a API da OpenAI. |
 | `python main.py --delay 2.0` | Define o intervalo em segundos entre cada requisição para respeitar o fluxo da API (padrão: 1.5s). |
 | `python main.py --esperar-rate-limit` | Caso atinja a cota horária da OpenAI, o script aguarda automaticamente em contagem regressiva em vez de pausar. |
 | `python main.py --input-dir ./pasta` | Permite customizar a pasta das imagens de entrada. |
+| `python main.py --processed-dir ./pasta` | Permite customizar a pasta das variações geradas. |
 | `python main.py --results-dir ./saida` | Permite customizar a pasta dos relatórios finais. |
+
+---
+
+### C. Exemplos de Execução da Nova Escala (Qualidade 1 a 10)
+
+```powershell
+# Simulação rápida da escala 1 a 10 (sem gastar créditos da API):
+python main.py --qualidade-1-10 --dry-run
+
+# Execução oficial na API OpenAI com tratamento automático de rate limit:
+python main.py --qualidade-1-10 --esperar-rate-limit
+
+# Testando apenas imagens de IA na escala 1 a 10:
+python main.py --qualidade-1-10 --apenas-ia --esperar-rate-limit
+```
 
 ---
 
